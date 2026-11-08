@@ -1,0 +1,86 @@
+name: Publish Teng Baiye archive
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: teng-baiye-pages
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      tree: ${{ steps.source.outputs.tree }}
+      changed: ${{ steps.source.outputs.changed }}
+    steps:
+      - name: Check the canonical archive source
+        id: source
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = 'doubleteng';
+            const repo = 'tengteng';
+            const {data: commit} = await github.rest.repos.getCommit({owner, repo, ref: 'main'});
+            const {data: tree} = await github.rest.git.getTree({owner, repo, tree_sha: commit.commit.tree.sha});
+            const archive = tree.tree.find(item => item.path === 'teng-baiye' && item.type === 'tree');
+            if (!archive) throw new Error('Archive directory is missing from the source repository');
+            let previous = null;
+            try {
+              const response = await fetch('https://teng-baiye.org/deployment.json', {signal: AbortSignal.timeout(15000)});
+              if (response.ok) previous = await response.json();
+            } catch (error) {
+              core.info('No previous deployment manifest is available.');
+            }
+            core.setOutput('commit', commit.sha);
+            core.setOutput('tree', archive.sha);
+            core.setOutput('changed', context.eventName !== 'schedule' || previous?.archive_tree !== archive.sha);
+
+  deploy:
+    needs: source
+    if: needs.source.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Read the existing archive without changing the original site
+        uses: actions/checkout@v6
+        with:
+          repository: doubleteng/tengteng
+          ref: ${{ needs.source.outputs.commit }}
+          sparse-checkout: teng-baiye
+          path: source
+          persist-credentials: false
+      - name: Record source version
+        uses: actions/github-script@v7
+        env:
+          SOURCE_COMMIT: ${{ needs.source.outputs.commit }}
+          ARCHIVE_TREE: ${{ needs.source.outputs.tree }}
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('source/teng-baiye/index.html')) throw new Error('Archive homepage is missing');
+            fs.writeFileSync('source/teng-baiye/deployment.json', JSON.stringify({source_repository: 'doubleteng/tengteng', source_directory: 'teng-baiye', source_commit: process.env.SOURCE_COMMIT, archive_tree: process.env.ARCHIVE_TREE}) + '\n');
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Package archive at the domain root
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: source/teng-baiye
+          retention-days: 1
+      - name: Publish archive
+        id: deployment
+        uses: actions/deploy-pages@v4
